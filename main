@@ -1,0 +1,475 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from typing import List, Dict, Tuple, Optional
+
+version = 1.0.0
+class DissolutionDataProcessor:
+    def __init__(self, file_path: str, rsd_tolerance: float = 2.0, mean_tolerance: float = 1.0):
+        self.file_path = file_path
+        self.rsd_tolerance = rsd_tolerance
+        self.mean_tolerance = mean_tolerance
+        self.wb = None
+        self.report_maker_data = None
+        self.formulas_cache = {}  # Кэш для хранения формул
+        self.round_number = 4
+
+    def load_workbook(self):
+        """Загрузка файла Excel с сохранением формул"""
+        # Первая загрузка для получения формул
+        self.wb = load_workbook(self.file_path)
+        if 'Report_Maker' not in self.wb.sheetnames:
+            raise ValueError("Лист 'Report_Maker' не найден в файле")
+
+        # Вторая загрузка для получения значений (только для Report_Maker)
+        wb_values = load_workbook(self.file_path, data_only=True)
+        report_sheet_values = wb_values['Report_Maker']
+
+        # Извлечение данных о образцах
+        report_sheet = self.wb['Report_Maker']
+        self.report_maker_data = []
+        for row in report_sheet.iter_rows(min_row=12, max_row=26, min_col=2, max_col=4, values_only=True):
+            if row[0] and row[1] and row[2]:
+                sample_type = 'R' if 'R' in str(row[0][0]) else 'T'
+                sample_num = row[2]
+                self.report_maker_data.append({
+                    'name': row[1],
+                    'type': sample_type,
+                    'num': sample_num,
+                    'full_name': f"{sample_type}_{row[0]}_{sample_num}"
+                })
+        #print("self.report_maker_data", self.report_maker_data)
+        # Кэширование формул для блоков расчетов
+        self.cache_formulas()
+
+    def cache_formulas(self):
+        """Кэширование формул из блоков расчетов"""
+        for sheet_name in self.wb.sheetnames:
+            if self.is_sheet_processable(sheet_name):
+                sheet = self.wb[sheet_name]
+                self.formulas_cache[sheet_name] = {}
+
+                # Поиск всех образцов на листе
+                col = 4
+                while sheet.cell(row=62, column=col).value is not None:
+                    # Кэширование формул концентраций (D82-H93)
+                    conc_formulas = {}
+                    for row in range(82, 94):
+                        cell = sheet.cell(row=row, column=col)
+                        if cell.data_type == 'f':
+                            conc_formulas[row] = cell.value
+
+                    # Кэширование формул высвобождения (D98-H109)
+                    diss_formulas = {}
+                    for row in range(98, 110):
+                        cell = sheet.cell(row=row, column=col)
+                        if cell.data_type == 'f':
+                            diss_formulas[row] = cell.value
+
+                    self.formulas_cache[sheet_name][col] = {
+                        'concentration': conc_formulas,
+                        'dissolution': diss_formulas
+                    }
+
+                    col += 10
+
+    def is_sheet_processable(self, sheet_name: str) -> bool:
+        """Проверка, нужно ли обрабатывать лист"""
+        ok_markers = ['OK', 'ОК', '-OK', '_OK', '-ОК', '_ОК']
+        return sheet_name.startswith('DM') and not any(marker in sheet_name for marker in ok_markers)
+
+    def detect_plateau(self, data: List[List[float]], threshold: float = 0.05) -> Tuple[int, float, float]:
+        """Определение момента выхода на плато и его параметров
+        Возвращает (индекс точки плато, среднее на плато, std на плато)
+        """
+        # print("data", data)
+        # print("len(data)", len(data[0]))
+        for i in range(1, len(data[0])):
+            # Проверяем последние 3 точки у всех таблеток
+            last_values = []
+            for tablet in data:
+                if len(tablet) > i:
+                    last_values.append(tablet[i])
+
+            if len(last_values) < 3:
+                continue
+
+            current_rsd = (np.std(last_values) / np.mean(last_values)) * 100 if np.mean(last_values) != 0 else 0
+            prev_rsd = (np.std([tablet[i - 1] for tablet in data]) / np.mean(
+                [tablet[i - 1] for tablet in data])) * 100 if i > 0 else 0
+
+            # Критерий плато: изменение RSD меньше порога
+            if abs(current_rsd - prev_rsd) < threshold:
+                plateau_values = [tablet[i] for tablet in data]
+                return i, np.mean(plateau_values), np.std(plateau_values)
+
+        return len(data[0]), 0, 0  # Плато не обнаружено
+
+    def generate_new_tablets(self, existing_data: List[List[float]], time_points: List[float], num_new: int) -> List[List[float]]:
+        """Генерация новых таблеток с учетом тренда и плато"""
+        if num_new <= 0:
+            return existing_data
+
+        plateau_point, plateau_mean, plateau_std = self.detect_plateau(existing_data)
+        new_data = []
+
+        for _ in range(num_new):
+            new_tablet = []
+            prev_value = 0
+
+            for t in range(len(time_points)):
+                if t < plateau_point:
+                    # До плато - генерируем с монотонным ростом
+                    time_data = [tablet[t] for tablet in existing_data if len(tablet) > t]
+                    mean_val = np.mean(time_data)
+                    std_val = np.std(time_data, ddof=1)
+
+                    # Генерация с учетом монотонности
+                    new_val = np.random.normal(mean_val, std_val)
+                    new_val = max(new_val, prev_value) if t > 0 else new_val
+                    new_val = max(new_val, 0)  # Не допускаем отрицательных значений
+
+                    # Добавляем небольшой случайный рост
+                    if t > 0 and new_val <= prev_value:
+                        growth = np.random.uniform(0, mean_val * 0.05)
+                        new_val = prev_value + growth
+
+                    prev_value = new_val
+                else:
+                    # На плато - генерируем в пределах колебаний
+                    new_val = np.random.normal(plateau_mean, plateau_std)
+                    new_val = max(new_val, 0)
+
+                new_tablet.append(new_val)
+
+            new_data.append(new_tablet)
+
+        return existing_data + new_data
+
+    def get_sample_name(self, sheet, col: int) -> str:
+        """Получение имени образца с обработкой формул"""
+        name_cell = sheet.cell(row=62, column=col)
+        if name_cell.data_type == 'f':
+            # Для формул типа =Report_Maker!C12&" - "&Report_Maker!D12
+            # Создаем временную книгу для вычисления значения
+            temp_wb = load_workbook(self.file_path, data_only=True)
+            temp_sheet = temp_wb[sheet.title]
+            temp_cell = temp_sheet.cell(row=62, column=col)
+            temp_name = f"{temp_sheet.cell(row=62, column=col-1).value}_{temp_cell.value}"
+            # print("temp_name", str(temp_name))
+            return str(temp_name) if temp_name else name_cell.value
+        # print("str(name_cell.value)", str(name_cell.value))
+        return str(name_cell.value)
+
+    def calculate_factors(self, r_data: List[float], t_data: List[float], time_points: List[float],
+                          manual_points: Optional[List[int]] = None) -> Dict:
+        """Расчет факторов f1 и f2"""
+        results = {'f1_all': None, 'f1_selected': None, 'f2': None, 'points_used': [], 'message': ''}
+
+        # Проверка на высвобождение >85% в 15 минут
+        if len(time_points) >= 3 and time_points[2] == 15:
+            r_15min = r_data[2] if len(r_data) > 2 else 0
+            t_15min = t_data[2] if len(t_data) > 2 else 0
+
+            if r_15min > 85 and t_15min > 85:
+                results['message'] = "Оба препарата имеют высвобождение >85% за 15 мин. Расчет факторов не требуется."
+                return results
+
+        # Выбор точек для расчета
+        if manual_points:
+            points = [p for p in manual_points if p < len(time_points)]
+            if len(points) < 3:
+                results['message'] = "Недостаточно точек для расчета (нужно минимум 3)"
+                return results
+        else:
+            # Автоматический выбор точек (пропускаем первую если <15%)
+            start_idx = 1 if len(r_data) > 0 and r_data[0] < 15 else 0
+            points = list(range(start_idx, min(len(r_data), len(t_data))))
+
+            # Проверка RSD
+            for p in points:
+                if p >= len(r_data) or p >= len(t_data):
+                    continue
+
+                rsd_r = (np.std([r_data[p]]) / np.mean([r_data[p]])) * 100 if np.mean([r_data[p]]) != 0 else 0
+                rsd_t = (np.std([t_data[p]]) / np.mean([t_data[p]])) * 100 if np.mean([t_data[p]]) != 0 else 0
+
+                if rsd_r > 20 or rsd_t > 20:
+                    results[
+                        'message'] = f"Предупреждение: RSD >20% в точке {time_points[p]} мин (R: {rsd_r:.1f}%, T: {rsd_t:.1f}%)"
+
+        if len(points) < 3:
+            results['message'] = "Недостаточно точек для расчета (нужно минимум 3)"
+            return results
+
+        results['points_used'] = points
+
+        # Расчет f2 (подобия)
+        sum_term = 0
+        for p in points:
+            if p < len(r_data) and p < len(t_data):
+                term = (r_data[p] - t_data[p]) ** 2
+                sum_term += term
+
+        if sum_term > 0:
+            f2 = 50 * np.log10(100 / np.sqrt(1 + sum_term / len(points)))
+            results['f2'] = f2
+
+        # Расчет f1 (различия) - два варианта
+        # 1. Со всеми точками
+        sum_abs = 0
+        sum_r = 0
+        for p in range(min(len(r_data), len(t_data))):
+            sum_abs += abs(r_data[p] - t_data[p])
+            sum_r += r_data[p]
+
+        if sum_r > 0:
+            results['f1_all'] = (sum_abs / sum_r) * 100
+
+        # 2. С выбранными точками (как для f2)
+        sum_abs = 0
+        sum_r = 0
+        for p in points:
+            if p < len(r_data) and p < len(t_data):
+                sum_abs += abs(r_data[p] - t_data[p])
+                sum_r += r_data[p]
+
+        if sum_r > 0:
+            results['f1_selected'] = (sum_abs / sum_r) * 100
+
+        return results
+
+    def process_sheet(self, sheet):
+        """Обработка одного листа с сохранением формул"""
+        print(f"\nОбработка листа: {sheet.title}")
+
+        # Определение количества образцов на листе
+        sample_cols = {}
+        col = 4  # Начинаем с колонки D
+        time_points = []
+        for i in range(5):
+            cell = sheet.cell(row=63, column=col + i)
+            if cell.value is not None:
+                try:
+                    time_points.append(float(cell.value))
+                    # print(time_points)
+                except (ValueError, TypeError):
+                    pass
+        while sheet.cell(row=62, column=col).value is not None:
+            sample_name = sheet.cell(row=62, column=col - 1).value  # Статус из колонки C
+            if sample_name and isinstance(sample_name, str):
+                # print(sample_name)
+                sample_type = 'R' if 'R' in sample_name else 'T'
+                sample_num = ''.join(filter(str.isdigit, sample_name))
+                sample_id = f"{sample_type}{sample_num}"
+
+
+                # Получаем имя образца
+                sample_name = self.get_sample_name(sheet, col)
+                # print("sample name:", sample_name)
+                if sample_name.split("_")[0] == "None":
+                    break
+
+                # sample_id = sample_name.split("_")[0]
+                # Получаем временные точки (значения, не формулы)
+
+
+                sample_cols[sample_id] = {
+                    'start_col': col,
+                    'name': sample_name,
+                    'time_points': time_points
+                }
+
+            col += 10
+
+        if not sample_cols:
+            print("Не найдены образцы для обработки")
+            return
+
+        # Обработка каждого образца
+        # print("sample_cols", sample_cols)
+        for sample_id, sample_info in sample_cols.items():
+            print(f"\nОбработка образца {sample_id}: {sample_info['name']}")
+            start_col = sample_info['start_col']
+            time_points = sample_info['time_points']
+
+            # Загрузка значений через временную книгу
+            temp_wb = load_workbook(self.file_path, data_only=True)
+            temp_sheet = temp_wb[sheet.title]
+
+            # Извлечение существующих данных (значения)
+            existing_data = []
+            for row in range(64, 76):
+                row_data = []
+                # print("time_points", time_points)
+                for t in range(len(time_points)):
+                    cell = temp_sheet.cell(row=row, column=start_col + t)
+                    if cell.value is not None:
+                        try:
+                            row_data.append(float(cell.value))
+                        except (ValueError, TypeError):
+                            pass
+                if row_data:
+                    existing_data.append(row_data)
+
+            print(f"Найдено {len(existing_data)} таблеток с данными")
+
+            # Копирование исходных данных в блок D168-H179 (сохраняем формулы)
+            copy_col = start_col
+            print("copy_col", copy_col)
+            for i in range(64, 76):
+                for t in range(len(time_points)):
+                    src_cell = sheet.cell(row=i, column=start_col + t)
+                    dst_cell = sheet.cell(row=168 + (i - 64), column=copy_col + t)
+
+                    if src_cell.data_type == 'f':
+                        dst_cell.value = src_cell.value  # Копируем формулу
+                    else:
+                        dst_cell.value = src_cell.value  # Копируем значение
+
+            # Генерация новых таблеток (если нужно)
+            if len(existing_data) < 12:
+                num_new = 12 - len(existing_data)
+                print(f"Генерация {num_new} новых таблеток...")
+
+                new_data = self.generate_new_tablets(existing_data, time_points, num_new)
+
+                # Запись новых данных (только значения)
+                for i, tablet in enumerate(new_data):
+                    for t, value in enumerate(tablet):
+                        sheet.cell(row=64 + i, column=start_col + t, value=round(value, self.round_number))
+
+                print("Новые данные записаны")
+
+            # Восстановление формул в блоках расчетов
+            self.restore_formulas(sheet, start_col, len(time_points))
+
+        # Расчет факторов f1 и f2 для пар R-T
+        self.calculate_factors_for_pairs(sheet, sample_cols)
+
+    def restore_formulas(self, sheet, start_col, num_time_points):
+        """Восстановление формул в блоках расчетов"""
+        sheet_name = sheet.title
+        if sheet_name in self.formulas_cache and start_col in self.formulas_cache[sheet_name]:
+            formulas = self.formulas_cache[sheet_name][start_col]
+
+            # Восстановление формул концентраций
+            conc_formulas = formulas.get('concentration', {})
+            for row, formula in conc_formulas.items():
+                for t in range(num_time_points):
+                    sheet.cell(row=row, column=start_col + t, value=formula)
+
+            # Восстановление формул высвобождения
+            diss_formulas = formulas.get('dissolution', {})
+            for row, formula in diss_formulas.items():
+                for t in range(num_time_points):
+                    sheet.cell(row=row, column=start_col + t, value=formula)
+
+
+    def update_calculated_blocks(self, sheet, start_col, num_time_points):
+        """Обновление блоков с расчетными значениями"""
+        # Блок концентраций (D82-H93)
+        for row in range(82, 94):
+            # Проверяем, есть ли значение в первой ячейке
+            base_value = sheet.cell(row=row, column=start_col).value
+            if base_value is not None:
+                try:
+                    float(base_value)  # Проверяем, что это число
+                    for t in range(1, num_time_points):
+                        # Копируем формулу или значение из первой ячейки
+                        sheet.cell(row=row, column=start_col + t,
+                                   value=sheet.cell(row=row, column=start_col).value)
+                except (ValueError, TypeError):
+                    pass
+
+        # Блок высвобождения (D98-H109)
+        for row in range(98, 110):
+            base_value = sheet.cell(row=row, column=start_col).value
+            if base_value is not None:
+                try:
+                    float(base_value)
+                    for t in range(1, num_time_points):
+                        sheet.cell(row=row, column=start_col + t,
+                                   value=sheet.cell(row=row, column=start_col).value)
+                except (ValueError, TypeError):
+                    pass
+
+    def calculate_factors_for_pairs(self, sheet, sample_cols):
+        """Расчет факторов f1 и f2 для пар референтный-тестовый"""
+        # Группируем образцы по номерам (R1-T1, R2-T2 и т.д.)
+        samples_by_num = {}
+        for sample_id, info in sample_cols.items():
+            num = ''.join(filter(str.isdigit, sample_id))
+            if num not in samples_by_num:
+                samples_by_num[num] = {}
+            samples_by_num[num][sample_id[0]] = info
+
+        # Обработка пар
+        for num, pair in samples_by_num.items():
+            if 'R' in pair and 'T' in pair:
+                print(f"\nРасчет факторов для пары R{num}-T{num}")
+
+                # Извлечение данных высвобождения
+                r_col = pair['R']['start_col']
+                t_col = pair['T']['start_col']
+                time_points = pair['R']['time_points']
+
+                r_data = []
+                t_data = []
+                for row in range(98, 110):  # Строки высвобождения
+                    r_val = sheet.cell(row=row, column=r_col).value
+                    t_val = sheet.cell(row=row, column=t_col).value
+                    if r_val is not None and t_val is not None:
+                        r_data.append(float(r_val))
+                        t_data.append(float(t_val))
+
+                if len(r_data) < 3 or len(t_data) < 3:
+                    print(f"Недостаточно данных для расчета (R: {len(r_data)}, T: {len(t_data)})")
+                    continue
+
+                # Расчет факторов
+                results = self.calculate_factors(r_data, t_data, time_points)
+
+                # Вывод результатов
+                if results['message']:
+                    print(results['message'])
+
+                if results['f2'] is not None:
+                    print(f"Фактор подобия f2: {results['f2']:.2f}")
+                    print(f"Использованные точки (мин): {[time_points[p] for p in results['points_used']]}")
+                    print(f"Значения R в этих точках: {[r_data[p] for p in results['points_used']]}")
+                    print(f"Значения T в этих точках: {[t_data[p] for p in results['points_used']]}")
+
+                if results['f1_all'] is not None and results['f1_selected'] is not None:
+                    print(f"Фактор различия f1 (все точки): {results['f1_all']:.2f}%")
+                    print(f"Фактор различия f1 (выбранные точки): {results['f1_selected']:.2f}%")
+
+    def process_all_sheets(self):
+        """Обработка всех листов в файле"""
+        if not self.wb:
+            self.load_workbook()
+
+        for sheet_name in self.wb.sheetnames:
+            if self.is_sheet_processable(sheet_name):
+                sheet = self.wb[sheet_name]
+                self.process_sheet(sheet)
+
+    def save_results(self, output_path: str = None):
+        """Сохранение результатов"""
+        if not output_path:
+            base, ext = os.path.splitext(self.file_path)
+            output_path = f"{base}_processed{ext}"
+
+        self.wb.save(output_path)
+        print(f"\nРезультаты сохранены в файл: {output_path}")
+
+
+# Пример использования
+if __name__ == "__main__":
+    file_path = r"E:\Рабочий стол\CDKTManager\Шаблон_ТСКР_расчеты_v_1_1 предварительный.xlsx"
+    processor = DissolutionDataProcessor(file_path, rsd_tolerance=2.0, mean_tolerance=1.0)
+    processor.process_all_sheets()
+    processor.save_results()
