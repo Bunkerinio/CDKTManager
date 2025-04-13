@@ -2,20 +2,28 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import openpyxl
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from typing import List, Dict, Tuple, Optional
 
-version = 1.0.0
+#version = 1.0.1
 class DissolutionDataProcessor:
     def __init__(self, file_path: str, rsd_tolerance: float = 2.0, mean_tolerance: float = 1.0):
         self.file_path = file_path
+        base, ext = os.path.splitext(self.file_path)
+        self.output_path = f"{base}_processed{ext}"
         self.rsd_tolerance = rsd_tolerance
         self.mean_tolerance = mean_tolerance
         self.wb = None
         self.report_maker_data = None
         self.formulas_cache = {}  # Кэш для хранения формул
         self.round_number = 4
+        self.time_points = []
+        self.sample_cols = {}
+        self.sheet_info = {}
+        self.new_value_generator = False
+        self.factors_calculation = False
 
     def load_workbook(self):
         """Загрузка файла Excel с сохранением формул"""
@@ -168,11 +176,17 @@ class DissolutionDataProcessor:
                           manual_points: Optional[List[int]] = None) -> Dict:
         """Расчет факторов f1 и f2"""
         results = {'f1_all': None, 'f1_selected': None, 'f2': None, 'points_used': [], 'message': ''}
-
+        print("time_points", time_points)
+        print("r_data", r_data)
+        print("t_data", t_data)
         # Проверка на высвобождение >85% в 15 минут
-        if len(time_points) >= 3 and time_points[2] == 15:
-            r_15min = r_data[2] if len(r_data) > 2 else 0
-            t_15min = t_data[2] if len(t_data) > 2 else 0
+        if len(time_points) >= 3:
+            for i in range(0, len(time_points)):
+                if int(time_points[i]) == 15:
+                    r_15min = r_data[i]
+                    t_15min = t_data[i]
+                    print("r_15min", r_15min, type(r_15min))
+                    break
 
             if r_15min > 85 and t_15min > 85:
                 results['message'] = "Оба препарата имеют высвобождение >85% за 15 мин. Расчет факторов не требуется."
@@ -185,9 +199,10 @@ class DissolutionDataProcessor:
                 results['message'] = "Недостаточно точек для расчета (нужно минимум 3)"
                 return results
         else:
-            # Автоматический выбор точек (пропускаем первую если <15%)
-            start_idx = 1 if len(r_data) > 0 and r_data[0] < 15 else 0
+            # Автоматический выбор точек
+            start_idx = 1 if len(r_data) > 0 else 0
             points = list(range(start_idx, min(len(r_data), len(t_data))))
+            # print("points", points)
 
             # Проверка RSD
             for p in points:
@@ -247,14 +262,14 @@ class DissolutionDataProcessor:
         print(f"\nОбработка листа: {sheet.title}")
 
         # Определение количества образцов на листе
-        sample_cols = {}
+        self.sample_cols = {}
         col = 4  # Начинаем с колонки D
-        time_points = []
+        self.time_points = []
         for i in range(5):
             cell = sheet.cell(row=63, column=col + i)
             if cell.value is not None:
                 try:
-                    time_points.append(float(cell.value))
+                    self.time_points.append(float(cell.value))
                     # print(time_points)
                 except (ValueError, TypeError):
                     pass
@@ -277,22 +292,24 @@ class DissolutionDataProcessor:
                 # Получаем временные точки (значения, не формулы)
 
 
-                sample_cols[sample_id] = {
+                self.sample_cols[sample_id] = {
                     'start_col': col,
                     'name': sample_name,
-                    'time_points': time_points
+                    'time_points': self.time_points,
+                    'results': []
                 }
 
             col += 10
 
-        if not sample_cols:
+        if not self.sample_cols:
             print("Не найдены образцы для обработки")
             return
+        self.sheet_info[sheet] = self.sample_cols
 
+    def sample_handler(self):
         # Обработка каждого образца
-        # print("sample_cols", sample_cols)
-        for sample_id, sample_info in sample_cols.items():
-            print(f"\nОбработка образца {sample_id}: {sample_info['name']}")
+        for sample_id, sample_info in self.sample_cols.items():
+            print(f"\nОбработка образца {sample_info['name']}")
             start_col = sample_info['start_col']
             time_points = sample_info['time_points']
 
@@ -310,6 +327,7 @@ class DissolutionDataProcessor:
                     if cell.value is not None:
                         try:
                             row_data.append(float(cell.value))
+                            sample_info['results'].append(float(cell.value))
                         except (ValueError, TypeError):
                             pass
                 if row_data:
@@ -319,7 +337,7 @@ class DissolutionDataProcessor:
 
             # Копирование исходных данных в блок D168-H179 (сохраняем формулы)
             copy_col = start_col
-            print("copy_col", copy_col)
+            # print("copy_col", copy_col)
             for i in range(64, 76):
                 for t in range(len(time_points)):
                     src_cell = sheet.cell(row=i, column=start_col + t)
@@ -345,29 +363,13 @@ class DissolutionDataProcessor:
                 print("Новые данные записаны")
 
             # Восстановление формул в блоках расчетов
-            self.restore_formulas(sheet, start_col, len(time_points))
+            self.fill_release_formulas(sheet, start_col)
+        self.save_results()
+        print("Предварительное сохранение")
 
         # Расчет факторов f1 и f2 для пар R-T
-        self.calculate_factors_for_pairs(sheet, sample_cols)
 
-    def restore_formulas(self, sheet, start_col, num_time_points):
-        """Восстановление формул в блоках расчетов"""
-        sheet_name = sheet.title
-        if sheet_name in self.formulas_cache and start_col in self.formulas_cache[sheet_name]:
-            formulas = self.formulas_cache[sheet_name][start_col]
-
-            # Восстановление формул концентраций
-            conc_formulas = formulas.get('concentration', {})
-            for row, formula in conc_formulas.items():
-                for t in range(num_time_points):
-                    sheet.cell(row=row, column=start_col + t, value=formula)
-
-            # Восстановление формул высвобождения
-            diss_formulas = formulas.get('dissolution', {})
-            for row, formula in diss_formulas.items():
-                for t in range(num_time_points):
-                    sheet.cell(row=row, column=start_col + t, value=formula)
-
+        # print(f"\nРезультаты сохранены в файл: {self.output_path}")
 
     def update_calculated_blocks(self, sheet, start_col, num_time_points):
         """Обновление блоков с расчетными значениями"""
@@ -397,56 +399,75 @@ class DissolutionDataProcessor:
                 except (ValueError, TypeError):
                     pass
 
-    def calculate_factors_for_pairs(self, sheet, sample_cols):
+    def calculate_factors_for_pairs(self, file_path):
         """Расчет факторов f1 и f2 для пар референтный-тестовый"""
         # Группируем образцы по номерам (R1-T1, R2-T2 и т.д.)
-        samples_by_num = {}
-        for sample_id, info in sample_cols.items():
-            num = ''.join(filter(str.isdigit, sample_id))
-            if num not in samples_by_num:
-                samples_by_num[num] = {}
-            samples_by_num[num][sample_id[0]] = info
+        for sheet, info in self.sheet_info.items():
+            samples_by_num = {}
+            refs = []
+            tests = []
+            # print("sample_cols", sample_cols)
+            for sample_id, info in self.sample_cols.items():
+                num = info["name"][:2]
+                if num not in samples_by_num:
+                    samples_by_num[num] = {}
+                samples_by_num[num] = info
+            # print("samples_by_num", samples_by_num)
+            # Обработка пар
+            for num, info in samples_by_num.items():
+                if num[0] == "R":
+                    refs.append([num, info])
+                elif num[0] == "T":
+                    tests.append([num, info])
+            for ref in refs:
+                for test in tests:
+                    print(f"\nРасчет факторов для пары {ref[1]['name']} VS {test[1]['name']}")
 
-        # Обработка пар
-        for num, pair in samples_by_num.items():
-            if 'R' in pair and 'T' in pair:
-                print(f"\nРасчет факторов для пары R{num}-T{num}")
+                    # Извлечение данных высвобождения
+                    # print("ref", ref)
+                    # print("test", test)
+                    r_col = ref[1]['start_col']
+                    t_col = test[1]['start_col']
 
-                # Извлечение данных высвобождения
-                r_col = pair['R']['start_col']
-                t_col = pair['T']['start_col']
-                time_points = pair['R']['time_points']
+                    r_data = []
+                    t_data = []
+                    temp_wb = load_workbook(file_path, data_only=True)
+                    temp_sheet = temp_wb[sheet.title]
+                    # for row in temp_sheet.iter_rows():
+                    #     for cell in row:
+                    #         if cell.value is not None:
+                    #             print(cell.value, end='\t')  # Вывод через табуляцию
+                    #     print()  # Переход на новую строку после каждой строки таблицы
+                    for row in range(98, 110):  # Строки высвобождения
+                        r_val = temp_sheet.cell(row=row, column=r_col).value
+                        t_val = temp_sheet.cell(row=row, column=t_col).value
+                        if r_val is not None and t_val is not None:
+                            r_data.append(float(r_val))
+                            t_data.append(float(t_val))
 
-                r_data = []
-                t_data = []
-                for row in range(98, 110):  # Строки высвобождения
-                    r_val = sheet.cell(row=row, column=r_col).value
-                    t_val = sheet.cell(row=row, column=t_col).value
-                    if r_val is not None and t_val is not None:
-                        r_data.append(float(r_val))
-                        t_data.append(float(t_val))
+                    if len(r_data) < 3 or len(t_data) < 3:
+                        print(f"Недостаточно данных для расчета (R: {len(r_data)}, T: {len(t_data)})")
+                        continue
 
-                if len(r_data) < 3 or len(t_data) < 3:
-                    print(f"Недостаточно данных для расчета (R: {len(r_data)}, T: {len(t_data)})")
-                    continue
+                    # Расчет факторов
+                    results = self.calculate_factors(r_data, t_data, self.time_points)
+                    # print("results", results)
 
-                # Расчет факторов
-                results = self.calculate_factors(r_data, t_data, time_points)
+                    # Вывод результатов
+                    if results['message']:
+                        print(results['message'])
 
-                # Вывод результатов
-                if results['message']:
-                    print(results['message'])
+                    if results['f2'] is not None:
+                        print(f"Фактор подобия f2: {results['f2']:.2f}")
+                        print(f"Использованные точки (мин): {[self.time_points[p-1] for p in results['points_used']]}")
+                        print(f"Значения R в этих точках: {[r_data[p] for p in results['points_used']]}")
+                        print(f"Значения T в этих точках: {[t_data[p] for p in results['points_used']]}")
 
-                if results['f2'] is not None:
-                    print(f"Фактор подобия f2: {results['f2']:.2f}")
-                    print(f"Использованные точки (мин): {[time_points[p] for p in results['points_used']]}")
-                    print(f"Значения R в этих точках: {[r_data[p] for p in results['points_used']]}")
-                    print(f"Значения T в этих точках: {[t_data[p] for p in results['points_used']]}")
-
-                if results['f1_all'] is not None and results['f1_selected'] is not None:
-                    print(f"Фактор различия f1 (все точки): {results['f1_all']:.2f}%")
-                    print(f"Фактор различия f1 (выбранные точки): {results['f1_selected']:.2f}%")
-
+                    if results['f1_all'] is not None and results['f1_selected'] is not None:
+                        print(f"Фактор различия f1 (все точки): {results['f1_all']:.2f}")
+                        print(f"Фактор различия f1 (выбранные точки): {results['f1_selected']:.2f}")
+                temp_wb.save(r"E:\Рабочий стол\CDKTManager\Шаблон_ТСКР_расчеты_v_1_1 предварительный_2.xlsx")
+                print("Saved")
     def process_all_sheets(self):
         """Обработка всех листов в файле"""
         if not self.wb:
@@ -456,20 +477,66 @@ class DissolutionDataProcessor:
             if self.is_sheet_processable(sheet_name):
                 sheet = self.wb[sheet_name]
                 self.process_sheet(sheet)
+                if self.new_value_generator is True:
+                    print("Generator is active")
+                    self.sample_handler()
+        if self.factors_calculation is True:
+            print("Factor calculating is active")
+            if self.new_value_generator is True:
+        # print("self.sheet_info", self.sheet_info)
+                temp_wb = load_workbook(self.output_path, data_only=True)
+                temp_sheet = temp_wb[sheet.title]
+                test_val = temp_sheet.cell(row=98, column=4).value
+                i = input(f"Откройте файл {self.output_path}, сохраните, закройте его, вернитесь и нажмите любую кнопку")
+                while test_val == None:
+                    i = input(f"Ошибка. Откройте файл {self.output_path}, сохраните, закройте его, вернитесь и нажмите любую кнопку")
+                    temp_wb = load_workbook(self.output_path, data_only=True)
+                    temp_sheet = temp_wb[sheet.title]
+                    test_val = temp_sheet.cell(row=98, column=4).value
+                file_path = self.output_path
+            else:
+                file_path = self.file_path
+            self.calculate_factors_for_pairs(file_path)
+
+    def fill_release_formulas(self, sheet, start_col):
+        """Заполняет отсутствующие формулы в блоках высвобождения препарата"""
+        start_row = 98
+        end_row = 109
+        # Находим первую строку с формулой в этом блоке
+        ref_formula = None
+        for row in range(start_row, end_row + 1):
+            cell = sheet.cell(row=row, column=start_col)  # Первая ненулевая временная точка
+            if cell.data_type == 'f':  # Если ячейка содержит формулу
+                ref_formula = cell.value
+                break
+        # print("ref_formula", ref_formula)
+        # Заполняем формулы для всех строк
+        for row in range(start_row, end_row + 1):
+            for col_idx, time_col in enumerate(range(start_col, start_col + len(self.time_points))):
+                cell = sheet.cell(row=row, column=time_col)
+                if cell.data_type != 'f':  # Если нет формулы
+                # Создаем формулу аналогичную эталонной
+                    # Адаптируем формулу из эталонной
+                    # print(cell)
+                    # print(f'{openpyxl.utils.get_column_letter(start_col)}{int(ref_formula.split("/")[0][6:])}')
+                    # print(f'{openpyxl.utils.get_column_letter(time_col)}{row-16}')
+                    new_formula = ref_formula.replace(
+                        f'{openpyxl.utils.get_column_letter(start_col)}{int(ref_formula.split("/")[0][6:])}',
+                        f'{openpyxl.utils.get_column_letter(time_col)}{row-16}'
+                    )
+                    cell.value = new_formula
 
     def save_results(self, output_path: str = None):
         """Сохранение результатов"""
-        if not output_path:
-            base, ext = os.path.splitext(self.file_path)
-            output_path = f"{base}_processed{ext}"
-
         self.wb.save(output_path)
-        print(f"\nРезультаты сохранены в файл: {output_path}")
-
 
 # Пример использования
 if __name__ == "__main__":
     file_path = r"E:\Рабочий стол\CDKTManager\Шаблон_ТСКР_расчеты_v_1_1 предварительный.xlsx"
     processor = DissolutionDataProcessor(file_path, rsd_tolerance=2.0, mean_tolerance=1.0)
+    processor.new_value_generator = False
+    processor.factors_calculation = True
     processor.process_all_sheets()
-    processor.save_results()
+
+
+    # processor.save_results()
